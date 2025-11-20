@@ -8,7 +8,7 @@ import numpy as np
 from typing import Optional
 from extra.lr_scheduler import OneCycleLR
 from tinygrad import nn, dtypes, Tensor, Device, GlobalCounters, TinyJit, Variable
-from tinygrad.nn.state import get_state_dict
+from tinygrad.nn.state import get_state_dict, safe_save
 from tinygrad.nn import optim
 from tinygrad.helpers import Context, BEAM, WINO, getenv, colored, prod
 from extra.bench_log import BenchEvent, WallTimeEvent
@@ -320,8 +320,10 @@ def train_cifar():
   initial_div_factor = hyp['opt']['initial_div_factor']
   final_lr_ratio = hyp['opt']['final_lr_ratio']
   pct_start = hyp['opt']['percent_start']
-  lr_sched_bias     = OneCycleLR(opt_bias,     max_lr=hyp['opt']['bias_lr'],     pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=STEPS)
-  lr_sched_non_bias = OneCycleLR(opt_non_bias, max_lr=hyp['opt']['non_bias_lr'], pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=STEPS)
+  # allow dividing the learning rates via env var DIV_LR (useful for quick stabilization)
+  div_lr = float(getenv("DIV_LR", 1))
+  lr_sched_bias     = OneCycleLR(opt_bias,     max_lr=hyp['opt']['bias_lr']/div_lr,     pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=STEPS)
+  lr_sched_non_bias = OneCycleLR(opt_non_bias, max_lr=hyp['opt']['non_bias_lr']/div_lr, pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=STEPS)
 
   def train_step(model, optimizer, lr_scheduler, X, Y):
     out = model(X)
@@ -332,6 +334,22 @@ def train_cifar():
       # index 0 for bias and 1 for non-bias
       optimizer.zero_grad()
       loss.backward()
+      # optional gradient clipping (L2 norm) controlled by CLIP_NORM env var
+      if not getenv("DISABLE_GRAD_CLIP_NORM", 0):
+        opt_gradient_clip_norm = float(getenv("CLIP_NORM", 1.0))
+        try:
+          # realize grads before computing norms
+          Tensor.realize(*[p.grad for p in optimizer.params])
+          total_norm = Tensor(0.0, dtype=dtypes.default_float, device=optimizer.params[0].device)
+          for p in optimizer.params:
+            total_norm += p.grad.float().square().sum()
+          total_norm = total_norm.sqrt().contiguous()
+          for p in optimizer.params:
+            p.grad = p.grad * (opt_gradient_clip_norm / (total_norm + 1e-6)).clamp(max_=1.0)
+        except Exception:
+          # if grad clipping fails, continue without clipping
+          pass
+
       optimizer.step()
       lr_scheduler[0].step()
       lr_scheduler[1].step()
@@ -430,6 +448,34 @@ def train_cifar():
       print(colored(f"{eval_acc_pct=} >= {target}", "green"))
     else:
       raise ValueError(colored(f"{eval_acc_pct=} < {target}", "red"))
+
+  # Save a checkpoint using safe_save (.safetensors style)
+  try:
+    ckpt_path = getenv("CHECKPOINT_PATH", "examples/hlb_cifar10_ckpt.safetensors")
+    tensors = get_state_dict(model)
+    # save whitening weights as well
+    try:
+      tensors['whitening'] = W
+    except Exception:
+      pass
+    # save ema params if present (prefix with "ema.")
+    if model_ema is not None:
+      for k, v in get_state_dict(model_ema.net_ema).items():
+        tensors[f"ema.{k}"] = v
+    if len(tensors) > 0:
+      safe_save(tensors, ckpt_path, metadata={"steps": int(i), "eval_acc_pct": float(eval_acc_pct)})
+      print(f"Saved checkpoint to {ckpt_path}")
+      # also save EMA-only checkpoint separately for convenience
+      if model_ema is not None:
+        try:
+          ema_state = {k[len('ema.'):]: v for k, v in get_state_dict(model_ema.net_ema).items()}
+          ema_path = ckpt_path + '.ema.safetensors'
+          safe_save(ema_state, ema_path, metadata={"src": ckpt_path, "steps": int(i)})
+          print(f"Saved EMA-only checkpoint to {ema_path}")
+        except Exception as e:
+          print("Warning: failed to save EMA-only checkpoint:", e)
+  except Exception as e:
+    print("Warning: failed to save checkpoint:", e)
 
 if __name__ == "__main__":
   with WallTimeEvent(BenchEvent.FULL):
